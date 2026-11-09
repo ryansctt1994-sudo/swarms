@@ -1,4 +1,5 @@
 import os
+import re
 import secrets
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from swarms import Agent
+from api.agent_authorization import may_access_agent
 
 # Load environment variables
 load_dotenv()
@@ -57,7 +59,7 @@ class User(BaseModel):
     username: str
     is_active: bool = True
     is_admin: bool = False
-    api_keys: Dict[str, APIKey] = {}  # key -> APIKey object
+    api_keys: Dict[str, APIKey] = Field(default_factory=dict)  # key -> APIKey object
 
 
 
@@ -65,10 +67,6 @@ class AgentConfig(BaseModel):
     """Configuration model for creating a new agent."""
 
     agent_name: str = Field(..., description="Name of the agent")
-    model_name: str = Field(
-        ...,
-        description="Name of the llm you want to use provided by litellm",
-    )
     description: str = Field(
         default="", description="Description of the agent's purpose"
     )
@@ -227,11 +225,15 @@ class AgentStore:
     
     async def verify_agent_access(self, agent_id: UUID, user_id: UUID) -> bool:
         """Verify if a user has access to an agent."""
-        if agent_id not in self.agents:
+        if agent_id not in self.agents or user_id not in self.users:
             return False
-        return (
-            self.agent_metadata[agent_id]["owner_id"] == user_id
-            or self.users[user_id].is_admin
+        metadata = self.agent_metadata.get(agent_id)
+        if metadata is None:
+            return False
+        return may_access_agent(
+            metadata.get("owner_id"),
+            user_id,
+            is_admin=self.users[user_id].is_admin,
         )
     
     def validate_api_key(self, api_key: str) -> Optional[UUID]:
@@ -250,6 +252,15 @@ class AgentStore:
 
     async def create_agent(self, config: AgentConfig, user_id: UUID) -> UUID:
         """Create a new agent with the given configuration."""
+        if (not isinstance(config.agent_name, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", config.agent_name)
+                or config.agent_name in {".", ".."}):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid agent_name: use 1-64 safe ASCII filename characters",
+            )
+        if user_id not in self.users:
+            raise HTTPException(status_code=404, detail="User not found")
         try:
 
             agent = Agent(
@@ -273,6 +284,7 @@ class AgentStore:
             agent_id = uuid4()
             self.agents[agent_id] = agent
             self.agent_metadata[agent_id] = {
+                "owner_id": user_id,
                 "description": config.description,
                 "created_at": datetime.utcnow(),
                 "last_used": datetime.utcnow(),
@@ -417,7 +429,7 @@ class AgentStore:
         )
 
     async def clone_agent(
-        self, agent_id: UUID, new_name: str
+        self, agent_id: UUID, new_name: str, user_id: UUID
     ) -> UUID:
         """Clone an existing agent with a new name."""
         original_agent = await self.get_agent(agent_id)
@@ -433,7 +445,7 @@ class AgentStore:
             tags=original_metadata["tags"],
         )
 
-        return await self.create_agent(config)
+        return await self.create_agent(config, user_id)
 
     async def delete_agent(self, agent_id: UUID) -> None:
         """Delete an agent."""
@@ -448,8 +460,14 @@ class AgentStore:
         if agent.autosave and os.path.exists(agent.saved_state_path):
             os.remove(agent.saved_state_path)
 
+        owner_id = self.agent_metadata[agent_id].get("owner_id")
         del self.agents[agent_id]
         del self.agent_metadata[agent_id]
+        if owner_id in self.user_agents:
+            self.user_agents[owner_id] = [
+                existing for existing in self.user_agents[owner_id]
+                if existing != agent_id
+            ]
         logger.info(f"Deleted agent {agent_id}")
 
     async def process_completion(
@@ -580,18 +598,36 @@ class SwarmsAPI:
         # Initialize the store using the singleton manager
         self.store = StoreManager.get_instance()
         
-        # Configure CORS
+        # Cross-origin requests are denied unless an operator opts in to
+        # explicit origins. Wildcard + credentialed requests are prohibited.
+        allowed_origins = [
+            origin.strip() for origin in os.getenv("SWARMS_CORS_ORIGINS", "").split(",")
+            if origin.strip()
+        ]
+        if "*" in allowed_origins:
+            raise ValueError("SWARMS_CORS_ORIGINS cannot contain '*'")
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=[
-                "*"
-            ],  # Configure appropriately for production
+            allow_origins=allowed_origins,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
         )
 
         self._setup_routes()
+
+    async def _require_agent_access(self, agent_id: UUID, current_user: User) -> None:
+        """Fail closed on nonexistent or foreign agents before any action."""
+        if agent_id not in self.store.agents:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agent not found",
+            )
+        if not await self.store.verify_agent_access(agent_id, current_user.id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Agent access denied",
+            )
 
     def _setup_routes(self):
         """Set up API routes."""
@@ -697,15 +733,24 @@ class SwarmsAPI:
         async def list_agents(
             tags: Optional[List[str]] = Query(None),
             status: Optional[AgentStatus] = None,
+            current_user: User = Depends(get_current_user),
         ):
-            """List all agents, optionally filtered by tags and status."""
-            return await self.store.list_agents(tags, status)
+            """List only agents belonging to the caller, unless administrator."""
+            summaries = await self.store.list_agents(tags, status)
+            if current_user.is_admin:
+                return summaries
+            owned = set(self.store.user_agents.get(current_user.id, []))
+            return [item for item in summaries if item.agent_id in owned]
 
         @self.app.patch(
             "/v1/agent/{agent_id}", response_model=Dict[str, str]
         )
-        async def update_agent(agent_id: UUID, update: AgentUpdate):
+        async def update_agent(
+            agent_id: UUID, update: AgentUpdate,
+            current_user: User = Depends(get_current_user),
+        ):
             """Update an existing agent's configuration."""
+            await self._require_agent_access(agent_id, current_user)
             await self.store.update_agent(agent_id, update)
             return {"status": "updated"}
 
@@ -713,22 +758,32 @@ class SwarmsAPI:
             "/v1/agent/{agent_id}/metrics",
             response_model=AgentMetrics,
         )
-        async def get_agent_metrics(agent_id: UUID):
+        async def get_agent_metrics(
+            agent_id: UUID, current_user: User = Depends(get_current_user),
+        ):
             """Get performance metrics for a specific agent."""
+            await self._require_agent_access(agent_id, current_user)
             return await self.store.get_agent_metrics(agent_id)
 
         @self.app.post(
             "/v1/agent/{agent_id}/clone",
             response_model=Dict[str, UUID],
         )
-        async def clone_agent(agent_id: UUID, new_name: str):
+        async def clone_agent(
+            agent_id: UUID, new_name: str,
+            current_user: User = Depends(get_current_user),
+        ):
             """Clone an existing agent with a new name."""
-            new_id = await self.store.clone_agent(agent_id, new_name)
+            await self._require_agent_access(agent_id, current_user)
+            new_id = await self.store.clone_agent(agent_id, new_name, current_user.id)
             return {"agent_id": new_id}
 
         @self.app.delete("/v1/agent/{agent_id}")
-        async def delete_agent(agent_id: UUID):
+        async def delete_agent(
+            agent_id: UUID, current_user: User = Depends(get_current_user),
+        ):
             """Delete an agent."""
+            await self._require_agent_access(agent_id, current_user)
             await self.store.delete_agent(agent_id)
             return {"status": "deleted"}
 
@@ -738,8 +793,10 @@ class SwarmsAPI:
         async def create_completion(
             request: CompletionRequest,
             background_tasks: BackgroundTasks,
+            current_user: User = Depends(get_current_user),
         ):
             """Process a completion request with the specified agent."""
+            await self._require_agent_access(request.agent_id, current_user)
             try:
                 agent = await self.store.get_agent(request.agent_id)
 
@@ -759,6 +816,8 @@ class SwarmsAPI:
 
                 return response
 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Error processing completion: {str(e)}")
                 raise HTTPException(
@@ -767,8 +826,11 @@ class SwarmsAPI:
                 )
 
         @self.app.get("/v1/agent/{agent_id}/status")
-        async def get_agent_status(agent_id: UUID):
+        async def get_agent_status(
+            agent_id: UUID, current_user: User = Depends(get_current_user),
+        ):
             """Get the current status of an agent."""
+            await self._require_agent_access(agent_id, current_user)
             metadata = self.store.agent_metadata.get(agent_id)
             if not metadata:
                 raise HTTPException(
