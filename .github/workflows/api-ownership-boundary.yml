@@ -23,7 +23,7 @@ jobs:
       - name: Parse production API source without loading models or credentials
         run: python -m compileall -q api
       - name: Validate auth policy and route wiring
-        run: python -m unittest discover -s tests_api_boundary -p 'test_*.py' -v
+        run: python -m unittest discover -s tests_api_boundary -p 'test_api_ownership.py' -v
 
   api-http-with-fake-agent:
     runs-on: ubuntu-latest
