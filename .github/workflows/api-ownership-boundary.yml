@@ -1,0 +1,26 @@
+name: API Ownership Boundary (review-only)
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-ownership-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Parse production API source without loading models or credentials
+        run: python -m compileall -q api
+      - name: Validate auth policy and route wiring
+        run: python -m unittest discover -s tests_api_boundary -p 'test_*.py' -v
