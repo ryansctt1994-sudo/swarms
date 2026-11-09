@@ -9,11 +9,13 @@ New agent names are restricted to safe ASCII filename components to protect
 autosave paths. CORS defaults to no cross-origin origins; an operator may
 explicitly set a comma-delimited `SWARMS_CORS_ORIGINS` list without `*`.
 
-The stdlib regression workflow checks the pure ownership decision and
-inspects the actual route syntax for authentication/owner guards. These are
-**not end-to-end authenticated HTTP request tests** and make no runtime
-security assurance about deployed servers, reverse proxies or multi-worker
-processes.
+The regression workflow checks the pure ownership decision, validates
+route syntax on Python 3.11–3.13, and separately exercises **real FastAPI
+HTTP requests** under a test client using an in-process fake Agent, without
+calling a live model. These tests cover cross-user access denial, owner-only
+listing, clone/delete behavior, unsafe filenames and CORS defaults. They do
+**not** exercise a deployed server, production credentials, external networks,
+reverse proxies, multi-worker processes, real LLM execution or load tests.
 
 **Major remaining blockers:** public user self-registration issues an initial
 API key; API keys and ownership records live only in process memory; there is
